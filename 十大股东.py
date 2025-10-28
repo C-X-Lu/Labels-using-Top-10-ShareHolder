@@ -63,16 +63,16 @@ def build_label_for_single_stock(data: pd.DataFrame) -> tuple[pd.DataFrame, dict
         'z_index_separation': 2,    # z指数表明股权相对制衡阈值
         'balance_index': 1          # 股权制衡度阈值
     }
-    top1_concentration = 1 if data.loc[0, 'holder_pct'] > threshold['concentration_top1'] else 0
-    top1_separation = 1 if data.loc[0, 'holder_pct'] < threshold['separation_top1'] else 0
-    all10_concentration = 1 if data.loc[:, 'holder_pct'].sum() > threshold['concentration_all10'] else 0
-    all10_separation = 1 if data.loc[:, 'holder_pct'].sum() < threshold['separation_all10'] else 0
+    top1_concentration = 1 if data.loc[0, 'ratio'] > threshold['concentration_top1'] else 0
+    top1_separation = 1 if data.loc[0, 'ratio'] < threshold['separation_top1'] else 0
+    all10_concentration = 1 if data.loc[:, 'ratio'].sum() > threshold['concentration_all10'] else 0
+    all10_separation = 1 if data.loc[:, 'ratio'].sum() < threshold['separation_all10'] else 0
 
-    z_index = data.loc[0, 'holder_pct'] / data.loc[1, 'holder_pct']  # z指数
+    z_index = data.loc[0, 'ratio'] / data.loc[1, 'ratio']  # z指数
     z_index_concentration = 1 if z_index > threshold['z_index_concentration'] else 0    # 股权集中-Z指数
     z_index_separation = 1 if z_index < threshold['z_index_separation'] else 0          # 股权分散-Z指数
 
-    balance_index = data.loc[0, 'holder_pct'] / data.loc[1:, 'holder_pct'].sum()  # 股权制衡度
+    balance_index = data.loc[0, 'ratio'] / data.loc[1:, 'ratio'].sum()  # 股权制衡度
     equity_balance = 1 if balance_index > threshold['balance_index'] else 0  # 股权制衡-股权制衡度
 
     return data, {
@@ -120,7 +120,7 @@ def check_list_contain(
         data: pd.DataFrame,
         white_list: list[str],
         new_column: str,
-        check_column: str = 'holder_name'
+        check_column: str = 'name'
 ) -> pd.DataFrame:
     """检查股东名称中是否包含列表字段"""
     pattern = '|'.join(white_list)
