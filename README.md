@@ -1,5 +1,5 @@
 # Replication-of-Minute-Frequency-Factor
-使用wind金融终端的Python API：WindPy获取十大股东的数据，通过异步实现快速获取数据。
+使用akshare获取十大股东的数据，通过异步实现快速获取数据。
 在获取了十大股东的数据后按照股东性质和股权结构给股票打标签。
 ## 股东性质
 ### 国资
