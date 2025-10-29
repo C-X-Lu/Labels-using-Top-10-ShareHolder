@@ -1,57 +1,79 @@
-from typing import Literal, List
-from WindPy import w
+import os
+import akshare as ak
 import pandas as pd
 import numpy as np
 import datetime
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from tqdm import tqdm
-import os
+from typing import List
 
 
-def period_to_date(year: int, period: Literal['q1', 'h1', 'q2', 'y1']) -> datetime.date:
-    """万得参数转化为日期"""
-    period_dict = {
-        'q1': (3, 31),
-        'h1': (6, 30),
-        'q3': (9, 30),
-        'y1': (12, 31)
-    }
-    return datetime.date(year, period_dict[period][0], period_dict[period][1])
+def code_plus_exchange(code: str) -> str|None:
+    """为股票代码加上交易所代码以适用于akshare的接口"""
+    if code[:2] == '00' or code[:2] == '30':
+        return f"sz{code}"
+    elif code[:2] == '60' or code[:2] == '68':
+        return f"sh{code}"
+    elif code[:2] == '92':
+        return f"bj{code}"
+    else:
+        return None
 
-def get_data(code: str, year: int, period: Literal['q1', 'h1', 'q2', 'y1']) -> pd.DataFrame:
-    """获取数据"""
-    _err, shareholder_df = w.wset(
-        "top10shareholders",
-        f"windcode={code}; year={year}; period={period}", usedf=True
-    )
-    date = period_to_date(year, period)
+def get_data(code: str, end_date: str) -> pd.DataFrame:
+    """使用akshare的stock_gdfx_top_10_em接口获取数据"""
+    code_with_exchange = code_plus_exchange(code)
+    if code_with_exchange is None:
+        return pd.DataFrame(
+            columns=['code', 'end_date', 'holder_name', 'hold_num', 'holder_pct', 'change', 'change_ratio']
+        )
+    try:
+        shareholder_df = ak.stock_gdfx_top_10_em(symbol=code_with_exchange, date=end_date)
+    except ValueError:
+        return pd.DataFrame(
+            columns=['code', 'end_date', 'holder_name', 'hold_num', 'holder_pct', 'change', 'change_ratio']
+        )
     if len(shareholder_df) != 0:
-        announce_date = w.wss(
-            code,
-            "stm_issuingdate",
-            f"rptDate={date.year}{date.month:02d}{date.day:02d}"
-        )[1].iloc[0, 0]
+        shareholder_df.rename(
+            columns={
+                '股东名称': 'holder_name',
+                '持股数': 'hold_num',
+                '占总股本持股比例': 'holder_pct',
+                '增减': 'change',
+                '变动比率': 'change_ratio'
+            }, inplace=True
+        )
         shareholder_df['code'] = code
-        shareholder_df['end_date'] = period_to_date(year, period)
-        shareholder_df['ann_date'] = announce_date
-    return shareholder_df
+        shareholder_df['end_date'] = end_date
+        shareholder_df['end_date'] = pd.to_datetime(shareholder_df['end_date'], format='%Y%m%d')
+        return shareholder_df
+    else:
+        return pd.DataFrame(
+            columns=['code', 'end_date', 'holder_name', 'hold_num', 'holder_pct', 'change', 'change_ratio']
+        )
 
-def build_label_for_single_stock(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+def build_label(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     对股东数据打标签
     :param data:
     :return:
     """
+    if len(data) == 0:
+        return data, pd.DataFrame(columns=[
+            'code', 'ann_date', 'end_date', '国资', '外资', '内资',
+            '股权集中_第一大股东', '股权分散_第一大股东', '股权集中_前十大股东', '股权分散_前十大股东',
+            'Z指数', '股权集中_Z指数', '股权分散_Z指数',
+            '股权制衡度', '股权制衡'
+        ])
     # 股东性质
     data = check_state_own(data)
     state_own = int(data['state_own'].astype(bool).any())
 
     data = check_foreign_capital(data)
-    foreign_capital = int(data['foreign_own'].astype(bool).any())
+    foreign_capital = int(data['foreign_capital'].astype(bool).any())
 
     data = check_domestic_capital(data)
-    domestic_capital = int(data['domestic_own'].astype(bool).any())
+    domestic_capital = int(data['domestic_capital'].astype(bool).any())
 
     # 股权结构
     threshold = {
@@ -63,21 +85,20 @@ def build_label_for_single_stock(data: pd.DataFrame) -> tuple[pd.DataFrame, dict
         'z_index_separation': 2,    # z指数表明股权相对制衡阈值
         'balance_index': 1          # 股权制衡度阈值
     }
-    top1_concentration = 1 if data.loc[0, 'ratio'] > threshold['concentration_top1'] else 0
-    top1_separation = 1 if data.loc[0, 'ratio'] < threshold['separation_top1'] else 0
-    all10_concentration = 1 if data.loc[:, 'ratio'].sum() > threshold['concentration_all10'] else 0
-    all10_separation = 1 if data.loc[:, 'ratio'].sum() < threshold['separation_all10'] else 0
+    top1_concentration = 1 if data.loc[0, 'holder_pct'] > threshold['concentration_top1'] else 0
+    top1_separation = 1 if data.loc[0, 'holder_pct'] < threshold['separation_top1'] else 0
+    all10_concentration = 1 if data.loc[:, 'holder_pct'].sum() > threshold['concentration_all10'] else 0
+    all10_separation = 1 if data.loc[:, 'holder_pct'].sum() < threshold['separation_all10'] else 0
 
-    z_index = data.loc[0, 'ratio'] / data.loc[1, 'ratio']  # z指数
+    z_index = data.loc[0, 'holder_pct'] / data.loc[1, 'holder_pct']  # z指数
     z_index_concentration = 1 if z_index > threshold['z_index_concentration'] else 0    # 股权集中-Z指数
     z_index_separation = 1 if z_index < threshold['z_index_separation'] else 0          # 股权分散-Z指数
 
-    balance_index = data.loc[0, 'ratio'] / data.loc[1:, 'ratio'].sum()  # 股权制衡度
+    balance_index = data.loc[0, 'holder_pct'] / data.loc[1:, 'holder_pct'].sum()  # 股权制衡度
     equity_balance = 1 if balance_index > threshold['balance_index'] else 0  # 股权制衡-股权制衡度
 
-    return data, {
+    return data, pd.DataFrame({
         'code': data.loc[0, 'code'],
-        'ann_date': data.loc[0, 'ann_date'],
         'end_date': data.loc[0, 'end_date'],
         '国资': state_own,
         '外资': foreign_capital,
@@ -91,36 +112,13 @@ def build_label_for_single_stock(data: pd.DataFrame) -> tuple[pd.DataFrame, dict
         '股权分散_Z指数': z_index_separation,
         '股权制衡度': balance_index,
         '股权制衡': equity_balance
-    }
-
-def build_label(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """对给定日期的所有股票打标签"""
-    data_with_label = []
-    label = []
-    if len(data) < 10:
-        return pd.DataFrame(), pd.DataFrame()
-    for code in data['code'].unique():
-        single_data = data.loc[data['code'] == code, :]
-        single_data = single_data.sort_values('holder_pct', ascending=False, ignore_index=True)
-        if len(single_data) < 10:
-            continue
-        try:
-            single_data_with_label, label_dict = build_label_for_single_stock(single_data)
-            data_with_label.append(single_data_with_label)
-            label.append(label_dict)
-        except KeyError:
-            print(single_data)
-    try:
-        return pd.concat(data_with_label), pd.concat(label)
-    except KeyError as e:
-        print(f'出现错误: {e}, 对应的数据为: \n{data}')
-        return pd.DataFrame(), pd.DataFrame()
+    }, index=[0])
 
 def check_list_contain(
         data: pd.DataFrame,
         white_list: list[str],
         new_column: str,
-        check_column: str = 'name'
+        check_column: str = 'holder_name'
 ) -> pd.DataFrame:
     """检查股东名称中是否包含列表字段"""
     pattern = '|'.join(white_list)
@@ -175,14 +173,127 @@ def check_domestic_capital(data: pd.DataFrame) -> pd.DataFrame:
     )
     return data
 
+def fetch_code_list(
+        date: datetime.date
+) -> pd.DataFrame:
+    """使用akshare的stock_yjbb_em接口获取对应截止日期的股票列表"""
+    end_date_str: str = f"{date.year}{date.month:02d}{date.day:02d}"
+    code_df = ak.stock_yjbb_em(date=end_date_str)
+    return code_df
 
-class AsyncDataProcessor:
+def generate_param_list_and_announce_date(
+        data: pd.DataFrame, end_date: datetime.date
+) -> tuple[List[tuple[str, str]], pd.DataFrame]:
+    """生成参数列表和公告披露日期DataFrame"""
+    data.rename(columns={
+        '股票代码': 'code',
+        '最新公告日期': 'ann_date',
+    }, inplace=True)
+    data['ann_date'] = pd.to_datetime(data['ann_date'], format='%Y-%m-%d')
+    data['end_data'] = end_date
+    code_list = data['code'].tolist()
+    end_date_str = f"{end_date.year}{end_date.month:02d}{end_date.day:02d}"
+    param_list = [(code, end_date_str) for code in code_list]
+    return param_list, data
+
+def generate_date_list(
+        start_date: datetime.date, end_date: datetime.date
+) -> List[datetime.date]:
+    """生成日期列表"""
+    date_index = pd.date_range(start_date, end_date)
+    date_list = []
+    for date in date_index:
+        if (
+                date.month == 3 and date.day == 31
+        ) or (
+                date.month == 6 and date.day == 30
+        ) or (
+                date.month == 9 and date.day == 30
+        ) or (
+                date.month == 12 and date.day == 31
+        ):
+            date_list.append(date)
+    return date_list
+
+class AsyncDataProcessorForParamGenerating:
     def __init__(self):
-        self.executor = ThreadPoolExecutor(max_workers=16)
+        self.executor = ThreadPoolExecutor(max_workers=64)
 
     async def async_data_fetch(
             self,
-            params: tuple[str, int, Literal['q1', 'h1', 'q2', 'y1']]
+            date: datetime.date
+    ) -> pd.DataFrame:
+        """将参数和公告日期数据获取包装为异步版本"""
+        loop = asyncio.get_event_loop()
+
+        raw_code_list_data = await loop.run_in_executor(
+            self.executor,
+            fetch_code_list,
+            date
+        )
+        return raw_code_list_data
+
+    async def async_basic_process(
+            self,
+            end_date: datetime.date,
+            pbar: tqdm
+    ) -> tuple[List[tuple[str, str]], pd.DataFrame]:
+        """将数据处理包装为异步版本"""
+        data = await self.async_data_fetch(end_date)
+        param_list, announce_df = generate_param_list_and_announce_date(data, end_date)
+
+        pbar.update(1)
+        date_str = f"{end_date.year}{end_date.month:02d}{end_date.day:02d}"
+        pbar.set_description(f"处理: {date_str}")
+
+        return param_list, announce_df
+
+    async def process_batch(
+            self,
+            date_list: List[datetime.date]
+    ) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
+        """并发处理数据请求"""
+        with tqdm(total=len(date_list)) as pbar:
+            tasks = [
+                self.async_basic_process(date, pbar) for date in date_list
+            ]
+            results = await asyncio.gather(*tasks)
+        return results
+
+
+async def main_param_and_announce_date(
+        cache_path: str, start_date: datetime.date, end_date: datetime.date
+) -> tuple[list[tuple[str, str]], pd.DataFrame]:
+    """异步主函数1"""
+    try:
+        label_df_cache = pd.read_parquet(os.path.join(cache_path, 'shareholder_label.parquet'))
+        label_df_cache['end_date'] = pd.to_datetime(label_df_cache['end_date'], format='%Y%m%d')
+        start_date = max(start_date, label_df_cache['end_date'].max())
+    except FileNotFoundError:
+        pass
+
+    processor = AsyncDataProcessorForParamGenerating()
+    results = await processor.process_batch(generate_date_list(start_date, end_date))
+
+    param_list_list = [t[0] for t in results]
+    param_list = []
+    for p_l in param_list_list:
+        param_list += p_l
+
+    announce_df_list = [t[1] for t in results]
+    announce_df = pd.concat(announce_df_list, ignore_index=True)
+
+    return param_list, announce_df
+
+
+class AsyncDataProcessorForFetchAndLabelShareholderInfo:
+    """获取和标签化十大股东数据的异步类"""
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=128)
+
+    async def async_data_fetch(
+            self,
+            params: tuple[str, str]
     ) -> pd.DataFrame:
         """将数据获取包装为异步版本"""
         loop = asyncio.get_event_loop()
@@ -190,13 +301,13 @@ class AsyncDataProcessor:
         data = await loop.run_in_executor(
             self.executor,
             get_data,
-            params[0], params[1], params[2]
+            params[0], params[1]
         )
         return data
 
     async def async_build_label(
             self,
-            params: tuple[str, int, Literal['q1', 'h1', 'q2', 'y1']],
+            params: tuple[str, str],
             pbar: tqdm
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """将数据处理包装为异步版本"""
@@ -204,14 +315,14 @@ class AsyncDataProcessor:
         label = build_label(data)
 
         pbar.update(1)
-        date_str = f"{params[0]} {params[1]} {params[2]}"
+        date_str = f"{params[0]} {params[1]}"
         pbar.set_description(f"处理: {date_str}")
 
         return label
 
     async def process_batch(
             self,
-            param_list: List[tuple[str, int, Literal['q1', 'h1', 'q2', 'y1']]]
+            param_list: List[tuple[str, str]]
     ) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
         """并发处理数据请求"""
         with tqdm(total=len(param_list)) as pbar:
@@ -222,40 +333,12 @@ class AsyncDataProcessor:
         return results
 
 
-def generate_param_list(
-        start_date: datetime.date, end_date: datetime.date
-) -> List[tuple[str, int, Literal['q1', 'h1', 'q2', 'y1']]]:
-    """生成参数列表"""
-    date_to_period: dict[tuple[int, int], Literal['q1', 'h1', 'q2', 'y1']] = {
-        (3, 31): 'q1',
-        (6, 30): 'h1',
-        (9, 30): 'q2',
-        (12, 31): 'y1'
-    }
-    date_index = pd.date_range(start_date, end_date)
-    param_list: List[tuple[str, int, Literal['q1', 'h1', 'q2', 'y1']]] = []
-    for date in date_index:
-        if (
-            date.month == 3 and date.day == 31
-        ) or (
-            date.month == 6 and date.day == 30
-        ) or (
-            date.month == 9 and date.day == 30
-        ) or (
-            date.month == 12 and date.day == 31
-        ):
-            _err, code_df = w.wset(
-                "sectorconstituent",
-                f"date={date.year}-{date.month:02d}-{date.day:02d}; windcode=000985.CSI",
-                usedf=True
-            )
-            for code in code_df['wind_code']:
-                param = (code, date.year, date_to_period[(date.month, date.day)])
-                param_list.append(param)
-    return param_list
-
-async def main(cache_path: str, start_date: datetime.date):
-    """异步主函数"""
+async def main_shareholder(
+        cache_path: str,
+        param_list: List[tuple[str, str]],
+        announce_df: pd.DataFrame
+):
+    """异步主函数2"""
     try:
         labeled_df_cache = pd.read_parquet(os.path.join(cache_path, 'labeled_shareholder.parquet'))
         label_df_cache = pd.read_parquet(os.path.join(cache_path, 'shareholder_label.parquet'))
@@ -264,16 +347,12 @@ async def main(cache_path: str, start_date: datetime.date):
         label_df_cache['ann_date'] = pd.to_datetime(label_df_cache['ann_date'], format='%Y%m%d')
         label_df_cache['end_date'] = pd.to_datetime(label_df_cache['end_date'], format='%Y%m%d')
 
-        start_date = label_df_cache['end_date'].max()
     except FileNotFoundError:
         labeled_df_cache = pd.DataFrame()
         label_df_cache = pd.DataFrame()
-        start_date = start_date
-    end_date = datetime.date.today()
 
-    processor = AsyncDataProcessor()
+    processor = AsyncDataProcessorForFetchAndLabelShareholderInfo()
 
-    param_list = generate_param_list(start_date, end_date)
     results = await processor.process_batch(param_list=param_list)
 
     labeled_df = [labeled_df_cache] + [tp[0] for tp in results]
@@ -284,21 +363,31 @@ async def main(cache_path: str, start_date: datetime.date):
             .drop_duplicates(subset=['code', 'ann_date', 'holder_name'])
             .sort_values(by=['code', 'ann_date'], ignore_index=True)
     )
+    labeled_df = pd.merge(labeled_df, announce_df, on=['code', 'end_date'], how='inner')
     labeled_df.to_parquet(os.path.join(cache_path, 'labeled_shareholder.parquet'))
     label_df = (
         pd.concat(label_df)
             .drop_duplicates(subset=['code', 'ann_date'])
             .sort_values(by=['code', 'ann_date'], ignore_index=True)
     )
+    label_df = pd.merge(label_df, announce_df, on=['code', 'end_date'], how='inner')
     label_df.to_parquet(os.path.join(cache_path, 'shareholder_label.parquet'))
 
     return 0
 
+
 if __name__ == '__main__':
-    w.start()
-    asyncio.run(
-        main(
+    tu = asyncio.run(
+        main_param_and_announce_date(
             cache_path=r'D:\QuantData\ShareholderData',
-            start_date=datetime.date(2010, 1, 1)
+            start_date=datetime.date(2015, 1, 1),
+            end_date=datetime.date.today()
+        )
+    )
+    asyncio.run(
+        main_shareholder(
+            cache_path=r'D:\QuantData\ShareholderData',
+            param_list=tu[0],
+            announce_df=tu[1]
         )
     )
